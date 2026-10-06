@@ -23,7 +23,11 @@ const json = (body: unknown, status = 200) =>
 const MODEL = () =>
   Deno.env.get("GEMINI_MODEL") || "gemini-3.8-flash";
 
-const FALLBACK_MODEL = "gemini-3.6-flash";
+// Try Gemini models in order: primary -> fallback 1 -> fallback 2
+const FALLBACK_MODELS = [
+  "gemini-3.7-flash",
+  "gemini-3.6-flash",
+];
 
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 
@@ -816,8 +820,11 @@ export async function handler(
   try {
     const models = [
       MODEL(),
-      FALLBACK_MODEL,
-    ];
+      ...FALLBACK_MODELS,
+    ].filter(
+      (model, index, arr) =>
+        arr.indexOf(model) === index
+    );
 
     const maxAttempts = 2;
 
