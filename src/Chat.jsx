@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { supabase } from './supabaseClient.js'
 import { loadCheckins, getToday } from './storage.js'
 import { loadHabits, loadLogs } from './habitStorage.js'
@@ -15,13 +15,32 @@ const symptoms = [
   { id: 'other', label: 'อาการอื่น ๆ' },
 ]
 
-const memoryKey = 'healthtrack_fallback_memories'
+const chatSessionKey = 'healthtrack_chat_session'
 
-function readMemories() {
+const welcomeMessage = {
+  role: 'assistant',
+  content:
+    'สวัสดีครับ 👋 ผมคือ HealthTrack AI มีอะไรให้ผมช่วยวิเคราะห์เรื่องสุขภาพไหมครับ?',
+}
+
+function loadSessionMessages() {
   try {
-    return JSON.parse(localStorage.getItem(memoryKey) || '[]')
-  } catch {
-    return []
+    const saved = sessionStorage.getItem(chatSessionKey)
+
+    if (!saved) {
+      return [welcomeMessage]
+    }
+
+    const parsed = JSON.parse(saved)
+
+    if (!Array.isArray(parsed) || !parsed.length) {
+      return [welcomeMessage]
+    }
+
+    return parsed
+  } catch (error) {
+    console.error('Load chat session error:', error)
+    return [welcomeMessage]
   }
 }
 
@@ -164,13 +183,10 @@ function buildFallbackReply(
 }
 
 export default function Chat() {
-  const [messages, setMessages] = useState([
-    {
-      role: 'assistant',
-      content:
-        'สวัสดีครับ 👋 ผมคือ HealthTrack AI มีอะไรให้ผมช่วยวิเคราะห์เรื่องสุขภาพไหมครับ?',
-    },
-  ])
+  // โหลดประวัติจากแท็บนี้
+  const [messages, setMessages] = useState(() =>
+    loadSessionMessages(),
+  )
 
   const [input, setInput] = useState('')
   const [loading, setLoading] = useState(false)
@@ -178,6 +194,18 @@ export default function Chat() {
   const [selected, setSelected] = useState([])
   const [otherText, setOtherText] = useState('')
   const [fallbackError, setFallbackError] = useState('')
+
+  // เก็บข้อความไว้เฉพาะในแท็บ/เซสชันนี้
+  useEffect(() => {
+    try {
+      sessionStorage.setItem(
+        chatSessionKey,
+        JSON.stringify(messages),
+      )
+    } catch (error) {
+      console.error('Save chat session error:', error)
+    }
+  }, [messages])
 
   const sendMessage = async () => {
     const text = input.trim()
@@ -207,6 +235,23 @@ export default function Chat() {
 
       if (error) {
         throw error
+      }
+
+      // AI หลัก + สำรองใช้ไม่ได้ทั้งหมด -> บอกผู้ใช้ตรง ๆ แล้วเปิดแบบประเมินอาการ
+      if (data?.status === 'ai_exhausted') {
+        setMessages((prev) => [
+          ...prev,
+          {
+            role: 'assistant',
+            content: `${
+              data.notice ||
+              'ถึงลิมิตการใช้งาน AI แล้วครับ'
+            }\nเลือกอาการด้านล่างได้เลยครับ ผมจะเทียบกับบันทึกสุขภาพและ Smart Memory ให้แทน (ไม่ใช่การวินิจฉัยโรค)`,
+          },
+        ])
+
+        setShowHealthCheck(true)
+        return
       }
 
       if (!data?.answer) {
@@ -255,54 +300,69 @@ export default function Chat() {
     setFallbackError('')
 
     try {
-      const [allCheckins, habits, logs] =
-        await Promise.all([
-          loadCheckins(),
-          loadHabits().catch(() => []),
-          loadLogs().catch(() => ({})),
-        ])
+      let reply = ''
 
-      const today = getToday()
+      try {
+        // server วิเคราะห์ + บันทึก Smart Memory ลง Supabase (ai_memories)
+        const { data, error } =
+          await supabase.functions.invoke('chat', {
+            body: {
+              mode: 'symptom_check',
+              symptoms: selected,
+              otherText: otherText.trim(),
+              today: getToday(),
+              lang: 'th',
+            },
+          })
 
-      const start = new Date()
-      start.setDate(start.getDate() - 6)
+        if (error) {
+          throw error
+        }
 
-      const startDate = `${start.getFullYear()}-${String(
-        start.getMonth() + 1,
-      ).padStart(2, '0')}-${String(
-        start.getDate(),
-      ).padStart(2, '0')}`
+        if (!data?.answer) {
+          throw new Error('No symptom analysis returned')
+        }
 
-      const recent = allCheckins.filter(
-        (row) =>
-          row.date >= startDate &&
-          row.date <= today,
-      )
+        reply = data.answer
+      } catch (serverError) {
+        console.error(
+          'Server symptom check error:',
+          serverError,
+        )
 
-      const reply = buildFallbackReply(
-        selected,
-        otherText,
-        recent,
-        habits,
-        logs,
-      )
+        // ทางสุดท้าย: คำนวณในเครื่องจากข้อมูลที่โหลดได้ ไม่เขียน localStorage
+        const [allCheckins, habits, logs] =
+          await Promise.all([
+            loadCheckins(),
+            loadHabits().catch(() => []),
+            loadLogs().catch(() => ({})),
+          ])
 
-      const record = {
-        date: today,
-        symptoms: selected,
-        otherText: otherText.trim(),
-        reply,
-        savedAt: new Date().toISOString(),
+        const today = getToday()
+
+        const start = new Date()
+        start.setDate(start.getDate() - 6)
+
+        const startDate = `${start.getFullYear()}-${String(
+          start.getMonth() + 1,
+        ).padStart(2, '0')}-${String(
+          start.getDate(),
+        ).padStart(2, '0')}`
+
+        const recent = allCheckins.filter(
+          (row) =>
+            row.date >= startDate &&
+            row.date <= today,
+        )
+
+        reply = `${buildFallbackReply(
+          selected,
+          otherText,
+          recent,
+          habits,
+          logs,
+        )}\n\nℹ️ ครั้งนี้ยังบันทึกผลลง Smart Memory ไม่ได้`
       }
-
-      const memories = readMemories()
-
-      localStorage.setItem(
-        memoryKey,
-        JSON.stringify(
-          [record, ...memories].slice(0, 50),
-        ),
-      )
 
       setMessages((prev) => [
         ...prev,
@@ -354,7 +414,7 @@ export default function Chat() {
         >
           {messages.map((message, index) => (
             <div
-              key={index}
+              key={`${message.role}-${index}`}
               className={`chat-message ${message.role}`}
             >
               <div className="chat-bubble">
